@@ -66,8 +66,36 @@
     } else {
       currentTime.set(next);
     }
+    // Detect clip transitions and activate the new clip's media promptly.
+    manageActiveMedia(next);
     syncMedia(next);
     if (get(isPlaying)) raf = requestAnimationFrame(loop);
+  }
+
+  // Previous set of active clip ids — used to detect transitions.
+  let prevActiveIds: Set<string> = new Set();
+
+  function manageActiveMedia(time: number): void {
+    const active = activeClipIds(time);
+    // Start playing newly-active clips
+    for (const id of active) {
+      if (!prevActiveIds.has(id)) {
+        const vEl = videoEls[id];
+        if (vEl && vEl.paused && get(isPlaying)) vEl.play().catch(() => {});
+        const aEl = audioEls[id];
+        if (aEl && aEl.paused && get(isPlaying)) aEl.play().catch(() => {});
+      }
+    }
+    // Pause clips that are no longer active
+    for (const id of prevActiveIds) {
+      if (!active.has(id)) {
+        const vEl = videoEls[id];
+        if (vEl && !vEl.paused) vEl.pause();
+        const aEl = audioEls[id];
+        if (aEl && !aEl.paused) aEl.pause();
+      }
+    }
+    prevActiveIds = active;
   }
 
   function play(): void {
@@ -116,8 +144,9 @@
   });
 
   // ----- Media element management -----
-  // We render <video>/<img> for each visible clip and drive them by time.
-  // Visible clips = those in non-hidden video tracks.
+  // We render <video>/<img> for each visible clip but only ACTIVATE the ones
+  // near the playhead (current + next). Keeping all videos decoding at once
+  // causes stuttering; pausing off-screen ones frees the decoder.
   let videoEls: Record<string, HTMLVideoElement> = {};
   let audioEls: Record<string, HTMLAudioElement> = {};
 
@@ -130,14 +159,59 @@
     else delete audioEls[clipId];
   }
 
-  function playAllMedia(): void {
-    for (const el of Object.values(videoEls)) {
-      if (!el.paused) continue;
-      el.play().catch(() => {});
+  // Return the set of clip ids that should be "active" (decoding) at a given time:
+  // the clip under the playhead, plus the next clip (for seamless handoff).
+  function activeClipIds(time: number): Set<string> {
+    const p = $project;
+    const ids = new Set<string>();
+    for (const track of p.tracks) {
+      if (track.type !== "video" || track.hidden) continue;
+      const clips = [...track.clips].sort((a, b) => a.timelineStart - b.timelineStart);
+      for (let i = 0; i < clips.length; i++) {
+        const clip = clips[i];
+        const dur = clip.sourceEnd - clip.sourceStart;
+        const end = clip.timelineStart + dur;
+        if (time >= clip.timelineStart && time < end) {
+          ids.add(clip.id);
+          // preload next clip for smooth transition
+          if (i + 1 < clips.length) ids.add(clips[i + 1].id);
+          break;
+        }
+        // if we're in a gap before this clip, preload it
+        if (time < clip.timelineStart) {
+          ids.add(clip.id);
+          break;
+        }
+      }
     }
-    for (const el of Object.values(audioEls)) {
-      if (!el.paused) continue;
-      el.play().catch(() => {});
+    // audio: include clips near playhead too
+    for (const track of p.tracks) {
+      if (track.type !== "audio" || track.hidden || track.muted) continue;
+      for (const clip of track.clips) {
+        const dur = clip.sourceEnd - clip.sourceStart;
+        if (time >= clip.timelineStart - 0.1 && time < clip.timelineStart + dur) {
+          ids.add(clip.id);
+        }
+      }
+    }
+    return ids;
+  }
+
+  function playAllMedia(): void {
+    const active = activeClipIds(get(currentTime));
+    for (const [id, el] of Object.entries(videoEls)) {
+      if (active.has(id)) {
+        if (el.paused) el.play().catch(() => {});
+      } else {
+        if (!el.paused) el.pause();
+      }
+    }
+    for (const [id, el] of Object.entries(audioEls)) {
+      if (active.has(id)) {
+        if (el.paused) el.play().catch(() => {});
+      } else {
+        if (!el.paused) el.pause();
+      }
     }
   }
 
@@ -148,6 +222,7 @@
 
   function syncMedia(time: number): void {
     const p = $project;
+    const active = activeClipIds(time);
     // video clips
     for (const track of p.tracks) {
       if (track.type !== "video" || track.hidden) continue;
@@ -155,17 +230,19 @@
         const el = videoEls[clip.id];
         if (!el) continue;
         const dur = clip.sourceEnd - clip.sourceStart;
-        const start = clip.timelineStart;
-        const localTime = time - start;
-        if (localTime >= -0.05 && localTime <= dur) {
+        const localTime = time - clip.timelineStart;
+        if (active.has(clip.id) && localTime >= -0.05 && localTime <= dur) {
           const target = clip.sourceStart + Math.max(0, localTime);
-          if (Math.abs(el.currentTime - target) > 0.12) {
+          // tighter threshold while playing = smoother playback
+          if (Math.abs(el.currentTime - target) > 0.3) {
             try {
               el.currentTime = target;
             } catch {
               /* not loaded yet */
             }
           }
+        } else if (!el.paused) {
+          el.pause();
         }
       }
     }
@@ -177,15 +254,17 @@
         if (!el) continue;
         const dur = clip.sourceEnd - clip.sourceStart;
         const localTime = time - clip.timelineStart;
-        if (localTime >= -0.05 && localTime <= dur) {
+        if (active.has(clip.id) && localTime >= -0.05 && localTime <= dur) {
           const target = clip.sourceStart + Math.max(0, localTime);
-          if (Math.abs(el.currentTime - target) > 0.12) {
+          if (Math.abs(el.currentTime - target) > 0.3) {
             try {
               el.currentTime = target;
             } catch {
               /* ignore */
             }
           }
+        } else if (!el.paused) {
+          el.pause();
         }
       }
     }

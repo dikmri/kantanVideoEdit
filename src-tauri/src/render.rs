@@ -252,11 +252,13 @@ pub fn render_project(
     cmd.arg("-y");
 
     // Inputs
+    // -genpts ensures a clean PTS is generated even for VFR/broken sources.
     for input in &inputs {
         let dur = (input.clip.source_end - input.clip.source_start).max(0.05);
         if input.is_image {
             cmd.args(["-loop", "1", "-t", &fmt_dur(dur), "-i", &input.path]);
         } else {
+            cmd.args(["-fflags", "+genpts"]);
             cmd.args([
                 "-ss",
                 &fmt_dur(input.clip.source_start),
@@ -308,7 +310,12 @@ pub fn render_project(
             let dur = (clip.source_end - clip.source_start).max(0.05);
 
             // video filter chain
+            // fps + setpts=PTS-STARTPTS are CRITICAL: they normalise each clip's
+            // timestamps to a clean CFR (constant frame rate) starting at 0.
+            // Without this, VFR sources (e.g. screen captures, AI-generated
+            // videos) produce stuttering/frozen frames on the 2nd+ clip.
             let mut chain = format!("[{idx}:v]", idx = input.idx);
+            chain.push_str(&format!("fps={r},setpts=PTS-STARTPTS,", r = out_fps));
             chain.push_str(&format!(
                 "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,",
                 w = out_w,
@@ -353,10 +360,13 @@ pub fn render_project(
             graph.push_str(&chain);
 
             // overlay onto current base
+            // eof_action=pass: when this clip's frames run out, show the
+            //   background (previous layer) instead of repeating the last frame.
+            // repeatlast=0: don't keep showing the last overlay frame after enable ends.
             let next = format!("vo{}", overlay_count);
             overlay_count += 1;
             graph.push_str(&format!(
-                "[{prev}][{label}]overlay=x=0:y=0:enable='between(t,{s},{e})'[{next}];",
+                "[{prev}][{label}]overlay=x=0:y=0:eof_action=pass:repeatlast=0:enable='between(t,{s},{e})'[{next}];",
                 prev = last_video,
                 label = label,
                 s = fmt_dur(clip.timeline_start),
@@ -379,7 +389,7 @@ pub fn render_project(
         }
         let dur = (input.clip.source_end - input.clip.source_start).max(0.05);
         let mut chain = format!("[{idx}:a]", idx = input.idx);
-        chain.push_str("aresample=async=1");
+        chain.push_str("aresample=async=1,asetpts=PTS-STARTPTS");
         if (input.clip.volume - 1.0).abs() > 0.001 {
             chain.push_str(&format!(",volume={}", input.clip.volume));
         }
