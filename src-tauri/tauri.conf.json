@@ -45,7 +45,6 @@
     "resources": ["resources/bin/*"],
     "externalBin": [],
     "copyright": "",
-    "category": "AudioVideo",
     "shortDescription": "Fast, lightweight, cross-platform video editor",
     "longDescription": "Kantan Video Edit is a simple but fully-featured video editor: import, trim, split, filters, text overlays, fades, multilingual UI, and fast FFmpeg-based export."
   }
