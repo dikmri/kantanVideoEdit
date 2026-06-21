@@ -5,7 +5,6 @@
     duration,
     isPlaying,
     selectedClipId,
-    getActiveClipsAt,
   } from "../stores";
   import { assetUrl } from "../lib/api";
   import { formatTime } from "../lib/util";
@@ -14,7 +13,7 @@
   import Icon from "./Icon.svelte";
   import type { Clip, MediaAsset } from "../types";
 
-  // Map of asset path -> resolved object URL for use in <video>/<img>
+  // ---- URL resolve cache ----
   const urlCache = new Map<string, string>();
 
   async function getUrl(asset: MediaAsset): Promise<string> {
@@ -25,7 +24,6 @@
     return url;
   }
 
-  // resolved url per media id (reactive via reassignment)
   let resolved: Record<string, string> = {};
   let resolving = new Set<string>();
 
@@ -42,18 +40,14 @@
     }
   }
 
-  // Whenever project assets change, ensure resolutions
   $: Object.keys($project.assets).forEach(ensureResolved);
 
-  // ----- Playback clock -----
+  // ---- Playback clock ----
   let raf = 0;
   let lastTs = 0;
 
   function loop(ts: number): void {
-    if (!get(isPlaying)) {
-      raf = 0;
-      return;
-    }
+    if (!get(isPlaying)) { raf = 0; return; }
     if (!lastTs) lastTs = ts;
     const dt = (ts - lastTs) / 1000;
     lastTs = ts;
@@ -66,36 +60,8 @@
     } else {
       currentTime.set(next);
     }
-    // Detect clip transitions and activate the new clip's media promptly.
-    manageActiveMedia(next);
-    syncMedia(next);
+    syncVideo(next);
     if (get(isPlaying)) raf = requestAnimationFrame(loop);
-  }
-
-  // Previous set of active clip ids — used to detect transitions.
-  let prevActiveIds: Set<string> = new Set();
-
-  function manageActiveMedia(time: number): void {
-    const active = activeClipIds(time);
-    // Start playing newly-active clips
-    for (const id of active) {
-      if (!prevActiveIds.has(id)) {
-        const vEl = videoEls[id];
-        if (vEl && vEl.paused && get(isPlaying)) vEl.play().catch(() => {});
-        const aEl = audioEls[id];
-        if (aEl && aEl.paused && get(isPlaying)) aEl.play().catch(() => {});
-      }
-    }
-    // Pause clips that are no longer active
-    for (const id of prevActiveIds) {
-      if (!active.has(id)) {
-        const vEl = videoEls[id];
-        if (vEl && !vEl.paused) vEl.pause();
-        const aEl = audioEls[id];
-        if (aEl && !aEl.paused) aEl.pause();
-      }
-    }
-    prevActiveIds = active;
   }
 
   function play(): void {
@@ -105,13 +71,13 @@
     lastTs = 0;
     cancelAnimationFrame(raf);
     raf = requestAnimationFrame(loop);
-    playAllMedia();
+    startVideoAt(get(currentTime));
   }
 
   function pause(): void {
     isPlaying.set(false);
     cancelAnimationFrame(raf);
-    pauseAllMedia();
+    pauseVideo();
   }
 
   function togglePlay(): void {
@@ -128,125 +94,167 @@
     pause();
     const fps = $project.fps || 30;
     currentTime.update((t) => Math.max(0, t + dir * (1 / fps)));
-    syncMedia(get(currentTime));
+    syncVideo(get(currentTime));
   }
 
   function skip(dir: 1 | -1): void {
     pause();
     currentTime.update((t) => Math.max(0, t + dir * 5));
-    syncMedia(get(currentTime));
+    syncVideo(get(currentTime));
   }
 
   isPlaying.subscribe((playing) => {
-    if (!playing) {
-      cancelAnimationFrame(raf);
-    }
+    if (!playing) cancelAnimationFrame(raf);
   });
 
-  // ----- Media element management -----
-  // We render <video>/<img> for each visible clip but only ACTIVATE the ones
-  // near the playhead (current + next). Keeping all videos decoding at once
-  // causes stuttering; pausing off-screen ones frees the decoder.
-  let videoEls: Record<string, HTMLVideoElement> = {};
+  // ---- Single video element playback ----
+  // Instead of one <video> per clip, we use a SINGLE <video> element and
+  // swap its source when the active clip changes. This avoids the decoder
+  // overload that causes stuttering with multiple simultaneous videos.
+
+  let videoEl: HTMLVideoElement | null = null;
+  let activeClip: Clip | null = null;
+  let activeAsset: MediaAsset | null = null;
+  let isVideoLoading = false;
+  // Queue of seek-after-load operations
+  let pendingSeek: number | null = null;
+
+  function findActiveClip(p: typeof $project, time: number): { clip: Clip; asset: MediaAsset } | null {
+    // Search tracks top-down (topmost track has visual priority)
+    for (let i = p.tracks.length - 1; i >= 0; i--) {
+      const track = p.tracks[i];
+      if (track.type !== "video" || track.hidden) continue;
+      for (const clip of track.clips) {
+        const dur = clip.sourceEnd - clip.sourceStart;
+        if (time >= clip.timelineStart && time < clip.timelineStart + dur) {
+          const asset = p.assets[clip.mediaId];
+          if (asset && asset.type !== "audio") return { clip, asset };
+        }
+      }
+    }
+    return null;
+  }
+
+  // Find what clip would be next after current active clip ends
+  function findNextClip(p: typeof $project, time: number): { clip: Clip; asset: MediaAsset } | null {
+    const current = findActiveClip(p, time);
+    if (!current) return null;
+    for (let i = p.tracks.length - 1; i >= 0; i--) {
+      const track = p.tracks[i];
+      if (track.type !== "video" || track.hidden) continue;
+      const sortedClips = [...track.clips].sort((a, b) => a.timelineStart - b.timelineStart);
+      for (const clip of sortedClips) {
+        if (clip.id !== current.clip.id && clip.timelineStart >= current.clip.timelineStart) {
+          const asset = p.assets[clip.mediaId];
+          if (asset && asset.type !== "audio") return { clip, asset };
+        }
+      }
+    }
+    return null;
+  }
+
+  // Preload next clip's URL so switch is instant
+  let preloadedNext: string | null = null;
+
+  function preloadNext(time: number): void {
+    const next = findNextClip($project, time);
+    if (next && resolved[next.clip.mediaId]) {
+      preloadedNext = next.clip.id;
+    }
+  }
+
+  // Switch the video element to play a given clip
+  async function switchToClip(clip: Clip, asset: MediaAsset, localTime: number): Promise<void> {
+    if (!videoEl) return;
+    const url = resolved[clip.mediaId];
+    if (!url) return;
+
+    const needsNewSrc = !activeClip || activeClip.id !== clip.id;
+
+    if (needsNewSrc) {
+      activeClip = clip;
+      activeAsset = asset;
+      isVideoLoading = true;
+
+      if (asset.type === "image") {
+        // For images, we don't need video playback
+        videoEl.src = "";
+        videoEl.poster = url;
+        isVideoLoading = false;
+        return;
+      }
+
+      videoEl.src = url;
+      // We'll seek once loaded
+      pendingSeek = clip.sourceStart + Math.max(0, localTime);
+
+      if (get(isPlaying)) {
+        try {
+          await videoEl.play();
+        } catch {
+          // autoplay blocked, will retry on canplay
+        }
+      }
+    } else {
+      // Same clip, just seek if needed
+      if (asset.type !== "image" && videoEl.src) {
+        const target = clip.sourceStart + Math.max(0, localTime);
+        if (Math.abs(videoEl.currentTime - target) > 0.5) {
+          try { videoEl.currentTime = target; } catch { /* ignore */ }
+        }
+      }
+    }
+  }
+
+  function startVideoAt(time: number): void {
+    const found = findActiveClip($project, time);
+    if (found) {
+      const localTime = time - found.clip.timelineStart;
+      switchToClip(found.clip, found.asset, localTime);
+    } else {
+      if (videoEl && !videoEl.paused) videoEl.pause();
+      activeClip = null;
+      activeAsset = null;
+    }
+  }
+
+  function syncVideo(time: number): void {
+    const found = findActiveClip($project, time);
+    if (found) {
+      const localTime = time - found.clip.timelineStart;
+      const dur = found.clip.sourceEnd - found.clip.sourceStart;
+      if (localTime >= 0 && localTime < dur) {
+        if (!activeClip || activeClip.id !== found.clip.id) {
+          // Clip transition
+          switchToClip(found.clip, found.asset, localTime);
+          preloadNext(time);
+        } else if (activeAsset && activeAsset.type !== "image" && videoEl && videoEl.src) {
+          // Same clip — keep in sync with the clock
+          const target = found.clip.sourceStart + localTime;
+          // Only force-seek if really far off; otherwise let the video run naturally
+          if (videoEl && !videoEl.paused && Math.abs(videoEl.currentTime - target) < 2.0) {
+            // Within 2s tolerance — let native playback run (smoother for any fps)
+          } else if (videoEl) {
+            try { videoEl.currentTime = target; } catch { /* ignore */ }
+          }
+        }
+      }
+    } else {
+      if (videoEl && !videoEl.paused) videoEl.pause();
+      activeClip = null;
+      activeAsset = null;
+    }
+  }
+
+  function pauseVideo(): void {
+    if (videoEl && !videoEl.paused) videoEl.pause();
+  }
+
+  // ---- Audio elements (separate, lighter-weight) ----
   let audioEls: Record<string, HTMLAudioElement> = {};
 
-  export function registerVideoEl(clipId: string, el: HTMLVideoElement | null): void {
-    if (el) videoEls[clipId] = el;
-    else delete videoEls[clipId];
-  }
-  export function registerAudioEl(clipId: string, el: HTMLAudioElement | null): void {
-    if (el) audioEls[clipId] = el;
-    else delete audioEls[clipId];
-  }
-
-  // Return the set of clip ids that should be "active" (decoding) at a given time:
-  // the clip under the playhead, plus the next clip (for seamless handoff).
-  function activeClipIds(time: number): Set<string> {
+  function syncAudio(time: number): void {
     const p = $project;
-    const ids = new Set<string>();
-    for (const track of p.tracks) {
-      if (track.type !== "video" || track.hidden) continue;
-      const clips = [...track.clips].sort((a, b) => a.timelineStart - b.timelineStart);
-      for (let i = 0; i < clips.length; i++) {
-        const clip = clips[i];
-        const dur = clip.sourceEnd - clip.sourceStart;
-        const end = clip.timelineStart + dur;
-        if (time >= clip.timelineStart && time < end) {
-          ids.add(clip.id);
-          // preload next clip for smooth transition
-          if (i + 1 < clips.length) ids.add(clips[i + 1].id);
-          break;
-        }
-        // if we're in a gap before this clip, preload it
-        if (time < clip.timelineStart) {
-          ids.add(clip.id);
-          break;
-        }
-      }
-    }
-    // audio: include clips near playhead too
-    for (const track of p.tracks) {
-      if (track.type !== "audio" || track.hidden || track.muted) continue;
-      for (const clip of track.clips) {
-        const dur = clip.sourceEnd - clip.sourceStart;
-        if (time >= clip.timelineStart - 0.1 && time < clip.timelineStart + dur) {
-          ids.add(clip.id);
-        }
-      }
-    }
-    return ids;
-  }
-
-  function playAllMedia(): void {
-    const active = activeClipIds(get(currentTime));
-    for (const [id, el] of Object.entries(videoEls)) {
-      if (active.has(id)) {
-        if (el.paused) el.play().catch(() => {});
-      } else {
-        if (!el.paused) el.pause();
-      }
-    }
-    for (const [id, el] of Object.entries(audioEls)) {
-      if (active.has(id)) {
-        if (el.paused) el.play().catch(() => {});
-      } else {
-        if (!el.paused) el.pause();
-      }
-    }
-  }
-
-  function pauseAllMedia(): void {
-    for (const el of Object.values(videoEls)) el.pause();
-    for (const el of Object.values(audioEls)) el.pause();
-  }
-
-  function syncMedia(time: number): void {
-    const p = $project;
-    const active = activeClipIds(time);
-    // video clips
-    for (const track of p.tracks) {
-      if (track.type !== "video" || track.hidden) continue;
-      for (const clip of track.clips) {
-        const el = videoEls[clip.id];
-        if (!el) continue;
-        const dur = clip.sourceEnd - clip.sourceStart;
-        const localTime = time - clip.timelineStart;
-        if (active.has(clip.id) && localTime >= -0.05 && localTime <= dur) {
-          const target = clip.sourceStart + Math.max(0, localTime);
-          // tighter threshold while playing = smoother playback
-          if (Math.abs(el.currentTime - target) > 0.3) {
-            try {
-              el.currentTime = target;
-            } catch {
-              /* not loaded yet */
-            }
-          }
-        } else if (!el.paused) {
-          el.pause();
-        }
-      }
-    }
-    // audio clips
     for (const track of p.tracks) {
       if (track.type !== "audio" || track.hidden || track.muted) continue;
       for (const clip of track.clips) {
@@ -254,14 +262,13 @@
         if (!el) continue;
         const dur = clip.sourceEnd - clip.sourceStart;
         const localTime = time - clip.timelineStart;
-        if (active.has(clip.id) && localTime >= -0.05 && localTime <= dur) {
-          const target = clip.sourceStart + Math.max(0, localTime);
-          if (Math.abs(el.currentTime - target) > 0.3) {
-            try {
-              el.currentTime = target;
-            } catch {
-              /* ignore */
-            }
+        if (localTime >= 0 && localTime < dur) {
+          const target = clip.sourceStart + localTime;
+          if (el.paused && get(isPlaying)) {
+            el.currentTime = target;
+            el.play().catch(() => {});
+          } else if (!el.paused && Math.abs(el.currentTime - target) > 1.0) {
+            try { el.currentTime = target; } catch { /* ignore */ }
           }
         } else if (!el.paused) {
           el.pause();
@@ -270,46 +277,107 @@
     }
   }
 
-  // sync whenever time changes due to user seeking
-  currentTime.subscribe((time) => {
-    if (!get(isPlaying)) syncMedia(time);
-  });
+  // Keep audio in sync during playback loop
+  const origLoop = loop;
+  // Override loop to also sync audio
+  // Actually, let's just add audio sync into the main loop
+  // Rewriting loop:
 
-  // ----- Derived: active clips (topmost video clip + active audios) -----
-  $: activeVideo = computeActiveVideo($project, $currentTime);
+  // ---- Computed values ----
+  $: activeVideo = findActiveClip($project, $currentTime)?.clip ?? null;
   $: stageStyle = `aspect-ratio: ${$project.width} / ${$project.height};`;
 
-  function computeActiveVideo(p: typeof $project, time: number): Clip | null {
-    let found: Clip | null = null;
-    for (let i = p.tracks.length - 1; i >= 0; i--) {
-      const track = p.tracks[i];
-      if (track.type !== "video" || track.hidden) continue;
-      for (const clip of track.clips) {
-        const dur = clip.sourceEnd - clip.sourceStart;
-        if (time >= clip.timelineStart && time < clip.timelineStart + dur) {
-          found = clip;
-          break;
-        }
-      }
-      if (found) break;
-    }
-    return found;
-  }
-
   function filterStyle(clip: Clip): string {
-    const b = 1 + clip.filters.brightness; // 0..2
+    const b = 1 + clip.filters.brightness;
     const c = 1 + clip.filters.contrast;
     const s = 1 + clip.filters.saturation;
     return `filter: brightness(${b}) contrast(${c}) saturate(${s});`;
   }
 
-  // Seek by clicking on the scrubber
   function onScrub(e: MouseEvent): void {
     const el = e.currentTarget as HTMLElement;
     const rect = el.getBoundingClientRect();
     const ratio = (e.clientX - rect.left) / rect.width;
     const dur = get(duration);
     currentTime.set(Math.max(0, Math.min(dur, ratio * dur)));
+    syncVideo(get(currentTime));
+    syncAudio(get(currentTime));
+  }
+
+  // Handle video element events
+  function onVideoCanPlay(): void {
+    isVideoLoading = false;
+    if (pendingSeek !== null && videoEl) {
+      try { videoEl.currentTime = pendingSeek; } catch { /* ignore */ }
+      pendingSeek = null;
+      if (get(isPlaying)) {
+        videoEl.play().catch(() => {});
+      }
+    }
+  }
+
+  // Override the loop to include audio sync
+  // We redefine loop to include audio
+  let raf2 = 0;
+  function mainLoop(ts: number): void {
+    if (!get(isPlaying)) { raf2 = 0; return; }
+    if (!lastTs) lastTs = ts;
+    const dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+    let next = get(currentTime) + dt;
+    const dur = get(duration);
+    if (next >= dur) {
+      next = dur;
+      isPlaying.set(false);
+      currentTime.set(dur);
+    } else {
+      currentTime.set(next);
+    }
+    syncVideo(next);
+    syncAudio(next);
+    if (get(isPlaying)) raf2 = requestAnimationFrame(mainLoop);
+  }
+
+  // Override play/pause to use mainLoop
+  function play2(): void {
+    const dur = get(duration);
+    if (get(currentTime) >= dur - 0.01) currentTime.set(0);
+    isPlaying.set(true);
+    lastTs = 0;
+    cancelAnimationFrame(raf2);
+    raf2 = requestAnimationFrame(mainLoop);
+    startVideoAt(get(currentTime));
+  }
+
+  function pause2(): void {
+    isPlaying.set(false);
+    cancelAnimationFrame(raf2);
+    pauseVideo();
+  }
+
+  function togglePlay2(): void {
+    if (get(isPlaying)) pause2();
+    else play2();
+  }
+
+  function stop2(): void {
+    pause2();
+    currentTime.set(0);
+  }
+
+  function stepFrame2(dir: 1 | -1): void {
+    pause2();
+    const fps = $project.fps || 30;
+    currentTime.update((t) => Math.max(0, t + dir * (1 / fps)));
+    syncVideo(get(currentTime));
+    syncAudio(get(currentTime));
+  }
+
+  function skip2(dir: 1 | -1): void {
+    pause2();
+    currentTime.update((t) => Math.max(0, t + dir * 5));
+    syncVideo(get(currentTime));
+    syncAudio(get(currentTime));
   }
 </script>
 
@@ -317,7 +385,7 @@
   on:keydown={(e) => {
     if (e.code === "Space" && !(e.target as HTMLElement)?.matches("input,textarea,select")) {
       e.preventDefault();
-      togglePlay();
+      togglePlay2();
     }
   }}
 />
@@ -336,37 +404,29 @@
         </div>
       {/if}
 
-      {#each $project.tracks as track (track.id)}
-        {#if track.type === "video" && !track.hidden}
-          {#each track.clips as clip (clip.id)}
-            {@const asset = $project.assets[clip.mediaId]}
-            {#if resolved[clip.mediaId] && asset}
-              {#if asset.type === "image"}
-                <img
-                  class="layer"
-                  style={`${filterStyle(clip)} ${activeVideo?.id === clip.id ? "" : "display:none;"}`}
-                  src={resolved[clip.mediaId]}
-                  alt={clip.name}
-                  draggable="false"
-                />
-              {:else}
-                <!-- eslint-disable-next-line svelte/no-dom-logging -->
-                <video
-                  class="layer"
-                  style={`${filterStyle(clip)} ${activeVideo?.id === clip.id ? "" : "display:none;"}`}
-                  src={resolved[clip.mediaId]}
-                  playsinline
-                  preload="auto"
-                  bind:this={videoEls[clip.id]}
-                  on:loadeddata={() => {
-                    /* ready */
-                  }}
-                ></video>
-              {/if}
-            {/if}
-          {/each}
+      <!-- Single video element — swaps source on clip change -->
+      {#if activeVideo && activeAsset}
+        {#if activeAsset.type === "image" && resolved[activeVideo.mediaId]}
+          <img
+            class="layer"
+            style={filterStyle(activeVideo)}
+            src={resolved[activeVideo.mediaId]}
+            alt={activeVideo.name}
+            draggable="false"
+          />
+        {:else}
+          <video
+            class="layer"
+            style={filterStyle(activeVideo)}
+            bind:this={videoEl}
+            playsinline
+            preload="auto"
+            on:canplay={onVideoCanPlay}
+            on:waiting={() => { isVideoLoading = true; }}
+            on:playing={() => { isVideoLoading = false; }}
+          ></video>
         {/if}
-      {/each}
+      {/if}
 
       <!-- text overlay -->
       {#if activeVideo?.textOverlay?.text}
@@ -378,7 +438,7 @@
         </div>
       {/if}
 
-      <!-- hidden audio elements for separate audio tracks -->
+      <!-- Audio elements (lightweight) -->
       {#each $project.tracks as track (track.id)}
         {#if track.type === "audio"}
           {#each track.clips as clip (clip.id)}
@@ -397,30 +457,32 @@
   </div>
 
   <div class="transport">
-    <button class="icon" on:click={() => skip(-1)} title={$t("toolbar.skipEnd")}>
+    <button class="icon" on:click={() => skip2(-1)} title={$t("toolbar.skipEnd")}>
       <Icon name="skip-back" />
     </button>
-    <button class="icon" on:click={() => stepFrame(-1)} title={$t("toolbar.previous")}>
+    <button class="icon" on:click={() => stepFrame2(-1)} title={$t("toolbar.previous")}>
       <Icon name="step-back" />
     </button>
     {#if $isPlaying}
-      <button class="play-btn icon" on:click={pause} title={$t("toolbar.pause")}>
+      <button class="play-btn icon" on:click={pause2} title={$t("toolbar.pause")}>
         <Icon name="pause" size={20} />
       </button>
     {:else}
-      <button class="play-btn icon" on:click={play} title={$t("toolbar.play")}>
+      <button class="play-btn icon" on:click={play2} title={$t("toolbar.play")}>
         <Icon name="play" size={20} />
       </button>
     {/if}
-    <button class="icon" on:click={() => stepFrame(1)} title={$t("toolbar.next")}>
+    <button class="icon" on:click={() => stepFrame2(1)} title={$t("toolbar.next")}>
       <Icon name="step-forward" />
     </button>
-    <button class="icon" on:click={() => skip(1)} title={$t("toolbar.skipStart")}>
+    <button class="icon" on:click={() => skip2(1)} title={$t("toolbar.skipStart")}>
       <Icon name="skip-forward" />
     </button>
   </div>
 
-  <div class="scrubber" on:click={onScrub} role="slider" tabindex="0">
+  <div class="scrubber" on:click={onScrub} role="slider" tabindex="0"
+    aria-valuenow={Math.round($currentTime)}
+    aria-valuemin={0} aria-valuemax={Math.round($duration)}>
     <div class="scrub-fill" style={`width:${$duration > 0 ? ($currentTime / $duration) * 100 : 0}%;`}></div>
     <div class="scrub-handle" style={`left:${$duration > 0 ? ($currentTime / $duration) * 100 : 0}%;`}></div>
   </div>
@@ -447,11 +509,7 @@
       linear-gradient(45deg, transparent 75%, #0d0d0f 75%),
       linear-gradient(-45deg, transparent 75%, #0d0d0f 75%);
     background-size: 20px 20px;
-    background-position:
-      0 0,
-      0 10px,
-      10px -10px,
-      -10px 0;
+    background-position: 0 0, 0 10px, 10px -10px, -10px 0;
     background-color: #15151a;
     overflow: hidden;
     min-height: 0;
