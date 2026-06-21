@@ -152,3 +152,24 @@ pub fn reveal_in_folder(path: String) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Return the absolute path of the log directory so the UI can display / reveal it.
+#[tauri::command]
+pub fn get_log_dir(app: AppHandle) -> Result<String, String> {
+    app.path()
+        .app_log_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Write a frontend log message into the Rust logger (→ log file).
+/// Called via invoke so it works even before the log JS plugin is fully initialised.
+#[tauri::command]
+pub fn write_frontend_log(level: String, message: String) {
+    match level.as_str() {
+        "error" => log::error!("[frontend] {}", message),
+        "warn" => log::warn!("[frontend] {}", message),
+        "info" => log::info!("[frontend] {}", message),
+        _ => log::debug!("[frontend] {}", message),
+    }
+}

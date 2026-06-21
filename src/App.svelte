@@ -19,7 +19,7 @@
   import { saveProject, openProject, newProject } from "./lib/projectIo";
   import { probeMediaBatch } from "./lib/api";
   import { stableId } from "./lib/util";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, confirm as confirmDialog, message as messageDialog } from "@tauri-apps/plugin-dialog";
   import { t } from "./i18n";
   import { theme } from "./stores";
 
@@ -45,7 +45,7 @@
         await importMedia();
         break;
       case "new":
-        if (confirm($t("dialog.replaceProjectMessage"))) {
+        if (await confirmDialog($t("dialog.replaceProjectTitle"), { title: $t("file.new"), kind: "warning" })) {
           await newProject();
         }
         break;
@@ -53,21 +53,21 @@
         try {
           await openProject();
         } catch (err) {
-          alert(String(err));
+          await messageDialog(String(err), { title: $t("file.open"), kind: "error" });
         }
         break;
       case "save":
         try {
           await saveProject(false);
         } catch (err) {
-          alert(String(err));
+          await messageDialog(String(err), { title: $t("file.save"), kind: "error" });
         }
         break;
       case "saveAs":
         try {
           await saveProject(true);
         } catch (err) {
-          alert(String(err));
+          await messageDialog(String(err), { title: $t("file.saveAs"), kind: "error" });
         }
         break;
       case "export":
@@ -145,7 +145,7 @@
       }
       commitHistory();
     } catch (err) {
-      alert(`${$t("status.importing")}: ${String(err)}`);
+      await messageDialog(`${$t("status.importing")}: ${String(err)}`, { kind: "error" });
     }
   }
 

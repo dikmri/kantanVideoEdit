@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { open, message as messageDialog } from "@tauri-apps/plugin-dialog";
   import { project, addMediaToProject, removeMedia, addClipToTrack, addTrack } from "../stores";
   import { probeMediaBatch, assetUrl } from "../lib/api";
   import { stableId, formatTime } from "../lib/util";
@@ -59,7 +59,7 @@
       }
     } catch (err) {
       console.error("Import failed", err);
-      alert(`${$t("status.importing")} : ${String(err)}`);
+      await messageDialog(`${$t("status.importing")} : ${String(err)}`, { kind: "error" });
     }
   }
 
@@ -134,7 +134,7 @@
     {#if assets.length === 0}
       <button class="empty-state" on:click={importFiles} disabled={importing}>
         <Icon name="import" size={28} />
-        <span>{$importing ? $t("status.importing") : $t("media.empty")}</span>
+        <span>{importing ? $t("status.importing") : $t("media.empty")}</span>
       </button>
     {:else}
       <div class="media-grid">
